@@ -211,6 +211,19 @@ class Event(Base):
     is_attending = Column(Boolean, default=False)
 
 
+class PriceAlert(Base):
+    __tablename__ = "price_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    record_id = Column(Integer, ForeignKey("records.id"))
+    target_price = Column(Float)
+    direction = Column(String)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    record = relationship("Record")
+
+
 class ExchangeOffer(Base):
     __tablename__ = "exchange_offers"
 

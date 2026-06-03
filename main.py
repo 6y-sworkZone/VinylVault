@@ -13,7 +13,8 @@ import httpx
 from models import (
     get_db, Record, Track, Tag, RecordTag, TrackTag,
     PriceHistory, PlayRecord, Playlist, PlaylistItem,
-    Device, MaintenanceRecord, Review, Event, ExchangeOffer
+    Device, MaintenanceRecord, Review, Event, ExchangeOffer,
+    PriceAlert, User
 )
 
 app = FastAPI(title="黑胶唱片收藏管理系统", version="1.0.0")
@@ -127,6 +128,30 @@ class EventCreate(BaseModel):
     location: Optional[str] = None
     description: Optional[str] = None
     is_attending: bool = False
+
+
+class MaintenanceCreate(BaseModel):
+    maintenance_type: str
+    maintenance_date: date
+    notes: Optional[str] = None
+    next_maintenance_date: Optional[date] = None
+
+
+class PriceAlertCreate(BaseModel):
+    record_id: int
+    target_price: float
+    direction: str = "above"
+
+
+class ExchangeOfferCreate(BaseModel):
+    record_id: int
+    offer_type: str
+    description: Optional[str] = None
+    contact_info: Optional[str] = None
+
+
+class CollectionGoalUpdate(BaseModel):
+    collection_goal: int
 
 
 @app.get("/")
@@ -385,6 +410,48 @@ def add_record_tag(record_id: int, tag_id: int, db: Session = Depends(get_db)):
     return {"message": "标签添加成功"}
 
 
+@app.post("/tracks/{track_id}/tags/{tag_id}")
+def add_track_tag(track_id: int, tag_id: int, db: Session = Depends(get_db)):
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="曲目不存在")
+    tag = db.query(Tag).filter(Tag.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="标签不存在")
+    existing = db.query(TrackTag).filter_by(track_id=track_id, tag_id=tag_id).first()
+    if existing:
+        return {"message": "标签已存在"}
+    db.add(TrackTag(track_id=track_id, tag_id=tag_id))
+    db.commit()
+    return {"message": "曲目标签添加成功"}
+
+
+@app.get("/tags/cloud")
+def get_tag_cloud(db: Session = Depends(get_db)):
+    record_tag_counts = db.query(
+        Tag.id,
+        Tag.name,
+        Tag.color,
+        func.count(RecordTag.id).label('count')
+    ).outerjoin(RecordTag).group_by(Tag.id).all()
+
+    track_tag_counts = db.query(
+        Tag.id,
+        func.count(TrackTag.id).label('count')
+    ).outerjoin(TrackTag).group_by(Tag.id).all()
+
+    track_count_map = {tid: cnt for tid, cnt in track_tag_counts}
+
+    result = []
+    for tid, name, color, count in record_tag_counts:
+        total = count + track_count_map.get(tid, 0)
+        if total > 0:
+            result.append({"id": tid, "name": name, "color": color, "count": total})
+
+    result.sort(key=lambda x: x["count"], reverse=True)
+    return result
+
+
 @app.post("/play-records/", response_model=dict)
 def create_play_record(play_record: PlayRecordCreate, db: Session = Depends(get_db)):
     if not play_record.play_date:
@@ -459,6 +526,32 @@ def get_scene_analysis(db: Session = Depends(get_db)):
             analysis[scene] = {}
         analysis[scene][genre] = count
     return analysis
+
+
+@app.get("/play-records/trend")
+def get_play_trend(period: str = Query("monthly", pattern="^(weekly|monthly)$"), db: Session = Depends(get_db)):
+    import sqlalchemy as sa
+    today = date.today()
+
+    if period == "weekly":
+        start_date = date(today.year - 1, today.month, today.day)
+        records = db.query(PlayRecord).filter(PlayRecord.play_date >= start_date).all()
+        trend = {}
+        for r in records:
+            iso_year, iso_week, _ = r.play_date.isocalendar()
+            key = f"{iso_year}-W{iso_week:02d}"
+            trend[key] = trend.get(key, 0) + 1
+        sorted_trend = dict(sorted(trend.items()))
+    else:
+        start_date = date(today.year - 2, today.month, today.day)
+        records = db.query(PlayRecord).filter(PlayRecord.play_date >= start_date).all()
+        trend = {}
+        for r in records:
+            key = f"{r.play_date.year}-{r.play_date.month:02d}"
+            trend[key] = trend.get(key, 0) + 1
+        sorted_trend = dict(sorted(trend.items()))
+
+    return {"period": period, "trend": sorted_trend}
 
 
 @app.post("/price-history/", response_model=dict)
@@ -538,6 +631,78 @@ def get_top_gainers(limit: int = 10, db: Session = Depends(get_db)):
     return gainers[:limit]
 
 
+@app.post("/price-alerts/", response_model=dict)
+def create_price_alert(alert: PriceAlertCreate, db: Session = Depends(get_db)):
+    record = db.query(Record).filter(Record.id == alert.record_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="唱片不存在")
+    db_alert = PriceAlert(**alert.dict())
+    db.add(db_alert)
+    db.commit()
+    db.refresh(db_alert)
+    return {"id": db_alert.id, **alert.dict()}
+
+
+@app.get("/price-alerts/check")
+def check_price_alerts(db: Session = Depends(get_db)):
+    alerts = db.query(PriceAlert).filter(PriceAlert.is_active == True).all()
+    triggered = []
+    for alert in alerts:
+        record = db.query(Record).filter(Record.id == alert.record_id).first()
+        if not record or not record.current_market_price:
+            continue
+        current = record.current_market_price
+        is_triggered = False
+        if alert.direction == "above" and current >= alert.target_price:
+            is_triggered = True
+        elif alert.direction == "below" and current <= alert.target_price:
+            is_triggered = True
+        if is_triggered:
+            triggered.append({
+                "alert_id": alert.id,
+                "record_id": record.id,
+                "album_name": record.album_name,
+                "artist": record.artist,
+                "current_price": current,
+                "target_price": alert.target_price,
+                "direction": alert.direction
+            })
+            alert.is_active = False
+    db.commit()
+    return {"triggered_count": len(triggered), "alerts": triggered}
+
+
+@app.get("/statistics/market-trend")
+def get_market_trend(months: int = 12, db: Session = Depends(get_db)):
+    from datetime import timedelta
+    today = date.today()
+    start_date = today - timedelta(days=months * 30)
+
+    history = db.query(PriceHistory).filter(
+        PriceHistory.record_date >= start_date
+    ).order_by(PriceHistory.record_date).all()
+
+    monthly_data = {}
+    for h in history:
+        key = f"{h.record_date.year}-{h.record_date.month:02d}"
+        if key not in monthly_data:
+            monthly_data[key] = {"prices": [], "count": 0}
+        monthly_data[key]["prices"].append(h.price)
+        monthly_data[key]["count"] += 1
+
+    trend = {}
+    for key in sorted(monthly_data.keys()):
+        prices = monthly_data[key]["prices"]
+        trend[key] = {
+            "avg_price": round(sum(prices) / len(prices), 2),
+            "min_price": round(min(prices), 2),
+            "max_price": round(max(prices), 2),
+            "record_count": monthly_data[key]["count"]
+        }
+
+    return {"period_months": months, "trend": trend}
+
+
 @app.get("/records/grouped")
 def get_records_grouped(group_by: str = Query(..., pattern="^(genre|year|label|country)$"), db: Session = Depends(get_db)):
     records = db.query(Record).filter(Record.is_wishlist == False).all()
@@ -600,6 +765,108 @@ def get_devices(device_type: Optional[str] = None, is_wishlist: bool = False, db
     ]
 
 
+@app.post("/devices/{device_id}/maintenance", response_model=dict)
+def create_maintenance(device_id: int, maintenance: MaintenanceCreate, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    db_maintenance = MaintenanceRecord(device_id=device_id, **maintenance.dict())
+    db.add(db_maintenance)
+    db.commit()
+    db.refresh(db_maintenance)
+    return {"id": db_maintenance.id, "device_id": device_id, **maintenance.dict()}
+
+
+@app.get("/devices/{device_id}/maintenance", response_model=List[dict])
+def get_maintenance_records(device_id: int, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    records = db.query(MaintenanceRecord).filter(MaintenanceRecord.device_id == device_id).order_by(desc(MaintenanceRecord.maintenance_date)).all()
+    return [
+        {
+            "id": m.id,
+            "device_id": m.device_id,
+            "maintenance_type": m.maintenance_type,
+            "maintenance_date": m.maintenance_date,
+            "notes": m.notes,
+            "next_maintenance_date": m.next_maintenance_date
+        }
+        for m in records
+    ]
+
+
+@app.put("/devices/{device_id}/usage-hours", response_model=dict)
+def update_usage_hours(device_id: int, hours: float, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    device.usage_hours = hours
+    db.commit()
+    db.refresh(device)
+    return {"id": device.id, "usage_hours": device.usage_hours}
+
+
+@app.get("/devices/wishlist", response_model=List[dict])
+def get_device_wishlist(db: Session = Depends(get_db)):
+    devices = db.query(Device).filter(Device.is_wishlist == True).all()
+    return [
+        {
+            "id": d.id,
+            "name": d.name,
+            "brand": d.brand,
+            "device_type": d.device_type,
+            "purchase_price": d.purchase_price,
+            "notes": d.notes
+        }
+        for d in devices
+    ]
+
+
+@app.get("/devices/statistics/cost")
+def get_device_cost_statistics(db: Session = Depends(get_db)):
+    total_cost = db.query(func.sum(Device.purchase_price)).filter(Device.is_wishlist == False).scalar() or 0
+    cost_by_type = db.query(
+        Device.device_type,
+        func.sum(Device.purchase_price).label('total'),
+        func.count(Device.id).label('count')
+    ).filter(Device.is_wishlist == False).group_by(Device.device_type).all()
+
+    return {
+        "total_cost": round(total_cost, 2),
+        "by_type": {t: {"total": round(total, 2), "count": count} for t, total, count in cost_by_type if t}
+    }
+
+
+@app.get("/devices/maintenance-alerts")
+def get_maintenance_alerts(db: Session = Depends(get_db)):
+    today = date.today()
+    from datetime import timedelta
+    alert_threshold = today + timedelta(days=7)
+
+    records = db.query(MaintenanceRecord).filter(
+        and_(
+            MaintenanceRecord.next_maintenance_date.isnot(None),
+            MaintenanceRecord.next_maintenance_date <= alert_threshold
+        )
+    ).all()
+
+    alerts = []
+    for m in records:
+        device = db.query(Device).filter(Device.id == m.device_id).first()
+        is_overdue = m.next_maintenance_date < today
+        alerts.append({
+            "device_id": m.device_id,
+            "device_name": device.name if device else "未知",
+            "maintenance_type": m.maintenance_type,
+            "next_maintenance_date": m.next_maintenance_date,
+            "is_overdue": is_overdue
+        })
+
+    alerts.sort(key=lambda x: x["next_maintenance_date"])
+    return alerts
+
+
 @app.post("/reviews/", response_model=dict)
 def create_review(review: ReviewCreate, db: Session = Depends(get_db)):
     db_review = Review(**review.dict())
@@ -649,6 +916,73 @@ def get_playlists(db: Session = Depends(get_db)):
     ]
 
 
+@app.get("/playlists/{playlist_id}", response_model=dict)
+def get_playlist_detail(playlist_id: int, db: Session = Depends(get_db)):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="播放列表不存在")
+
+    items = db.query(PlaylistItem).filter(PlaylistItem.playlist_id == playlist_id).order_by(PlaylistItem.order).all()
+    item_list = []
+    for item in items:
+        entry = {
+            "id": item.id,
+            "order": item.order,
+            "record_id": item.record_id,
+            "track_id": item.track_id,
+        }
+        if item.record_id:
+            record = db.query(Record).filter(Record.id == item.record_id).first()
+            entry["album_name"] = record.album_name if record else None
+            entry["artist"] = record.artist if record else None
+            entry["cover_image"] = record.cover_image if record else None
+        if item.track_id:
+            track = db.query(Track).filter(Track.id == item.track_id).first()
+            entry["track_title"] = track.title if track else None
+            entry["duration"] = track.duration if track else None
+        item_list.append(entry)
+
+    return {
+        "id": playlist.id,
+        "name": playlist.name,
+        "description": playlist.description,
+        "created_at": playlist.created_at,
+        "items": item_list
+    }
+
+
+@app.post("/playlists/{playlist_id}/items", response_model=dict)
+def add_playlist_item(playlist_id: int, record_id: Optional[int] = None, track_id: Optional[int] = None, order: Optional[int] = None, db: Session = Depends(get_db)):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="播放列表不存在")
+
+    if not record_id and not track_id:
+        raise HTTPException(status_code=400, detail="必须提供 record_id 或 track_id")
+
+    max_order = db.query(func.max(PlaylistItem.order)).filter(PlaylistItem.playlist_id == playlist_id).scalar() or 0
+    if order is None:
+        order = max_order + 1
+
+    db_item = PlaylistItem(playlist_id=playlist_id, record_id=record_id, track_id=track_id, order=order)
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return {"id": db_item.id, "playlist_id": playlist_id, "record_id": record_id, "track_id": track_id, "order": order}
+
+
+@app.delete("/playlists/{playlist_id}/items/{item_id}")
+def delete_playlist_item(playlist_id: int, item_id: int, db: Session = Depends(get_db)):
+    item = db.query(PlaylistItem).filter(
+        and_(PlaylistItem.id == item_id, PlaylistItem.playlist_id == playlist_id)
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="播放列表项目不存在")
+    db.delete(item)
+    db.commit()
+    return {"message": "删除成功"}
+
+
 @app.post("/events/", response_model=dict)
 def create_event(event: EventCreate, db: Session = Depends(get_db)):
     db_event = Event(**event.dict())
@@ -676,6 +1010,118 @@ def get_events(upcoming_only: bool = True, db: Session = Depends(get_db)):
         }
         for e in events
     ]
+
+
+@app.post("/exchange-offers/", response_model=dict)
+def create_exchange_offer(offer: ExchangeOfferCreate, db: Session = Depends(get_db)):
+    record = db.query(Record).filter(Record.id == offer.record_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="唱片不存在")
+    db_offer = ExchangeOffer(**offer.dict())
+    db.add(db_offer)
+    db.commit()
+    db.refresh(db_offer)
+    return {"id": db_offer.id, **offer.dict()}
+
+
+@app.get("/exchange-offers/", response_model=List[dict])
+def get_exchange_offers(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
+    offers = db.query(ExchangeOffer).order_by(desc(ExchangeOffer.created_at)).offset(skip).limit(limit).all()
+    result = []
+    for o in offers:
+        record = db.query(Record).filter(Record.id == o.record_id).first()
+        result.append({
+            "id": o.id,
+            "record_id": o.record_id,
+            "album_name": record.album_name if record else "未知",
+            "artist": record.artist if record else "未知",
+            "offer_type": o.offer_type,
+            "description": o.description,
+            "contact_info": o.contact_info,
+            "created_at": o.created_at
+        })
+    return result
+
+
+@app.get("/recommendations")
+def get_recommendations(limit: int = 10, db: Session = Depends(get_db)):
+    user_genres = db.query(
+        Record.genre,
+        func.count(Record.id).label('count')
+    ).filter(Record.is_wishlist == False).group_by(Record.genre).order_by(desc('count')).all()
+
+    if not user_genres:
+        return []
+
+    top_genres = [g for g, _ in user_genres[:3] if g]
+
+    existing_artist_names = set(
+        r.artist for r in db.query(Record).filter(Record.is_wishlist == False).all()
+    )
+
+    wishlist_records = db.query(Record).filter(
+        and_(
+            Record.is_wishlist == True,
+            Record.genre.in_(top_genres)
+        )
+    ).limit(limit).all()
+
+    recommendations = []
+    for r in wishlist_records:
+        recommendations.append({
+            "album_name": r.album_name,
+            "artist": r.artist,
+            "genre": r.genre,
+            "release_year": r.release_year,
+            "source": "wishlist"
+        })
+
+    if len(recommendations) < limit:
+        review_records = db.query(Review).filter(Review.rating >= 4).order_by(desc(Review.rating)).all()
+        seen = set()
+        for rv in review_records:
+            if len(recommendations) >= limit:
+                break
+            record = rv.record
+            if record and record.genre in top_genres and record.id not in seen:
+                seen.add(record.id)
+                recommendations.append({
+                    "album_name": record.album_name,
+                    "artist": record.artist,
+                    "genre": record.genre,
+                    "release_year": record.release_year,
+                    "source": "high_rated"
+                })
+
+    return recommendations[:limit]
+
+
+@app.get("/users/collection-goal")
+def get_collection_goal(db: Session = Depends(get_db)):
+    user = db.query(User).first()
+    if not user:
+        return {"collection_goal": 500, "current_count": 0, "remaining": 500}
+
+    current_count = db.query(Record).filter(Record.is_wishlist == False).count()
+    return {
+        "collection_goal": user.collection_goal,
+        "current_count": current_count,
+        "remaining": max(0, user.collection_goal - current_count),
+        "progress_percent": round(min(100, (current_count / user.collection_goal * 100)), 1) if user.collection_goal > 0 else 0
+    }
+
+
+@app.put("/users/collection-goal")
+def update_collection_goal(goal: CollectionGoalUpdate, db: Session = Depends(get_db)):
+    user = db.query(User).first()
+    if not user:
+        user = User(username="我", email="me@vinylvault.local", collection_goal=goal.collection_goal)
+        db.add(user)
+    else:
+        user.collection_goal = goal.collection_goal
+    db.commit()
+    db.refresh(user)
+    return {"collection_goal": user.collection_goal}
 
 
 @app.get("/discogs/search")
@@ -797,12 +1243,59 @@ def get_year_summary(year: int, db: Session = Depends(get_db)):
         and_(Record.created_at >= start_date, Record.created_at < end_date, Record.is_wishlist == False)
     ).group_by(Record.genre).order_by(desc('count')).limit(5).all()
 
+    best_discovery = db.query(Record).filter(
+        and_(Record.created_at >= start_date, Record.created_at < end_date, Record.is_wishlist == False)
+    ).order_by(desc(Record.current_market_price)).limit(5).all()
+
+    most_played_result = db.query(
+        Record.id,
+        Record.album_name,
+        Record.artist,
+        func.count(PlayRecord.id).label('play_count')
+    ).join(PlayRecord).filter(
+        and_(PlayRecord.play_date >= start_date, PlayRecord.play_date < end_date)
+    ).group_by(Record.id).order_by(desc('play_count')).limit(5).all()
+
+    highest_rated = db.query(Review).filter(
+        and_(Review.created_at >= start_date, Review.created_at < end_date, Review.rating >= 4)
+    ).order_by(desc(Review.rating)).limit(5).all()
+
     return {
         "year": year,
         "records_added": records_added,
         "total_spent": round(total_spent, 2),
         "play_count": play_count,
-        "top_genres": {g: c for g, c in top_genres if g}
+        "top_genres": {g: c for g, c in top_genres if g},
+        "best_discovery": [
+            {
+                "id": r.id,
+                "album_name": r.album_name,
+                "artist": r.artist,
+                "genre": r.genre,
+                "current_market_price": r.current_market_price,
+                "purchase_price": r.purchase_price
+            }
+            for r in best_discovery
+        ],
+        "most_played": [
+            {
+                "id": r.id,
+                "album_name": r.album_name,
+                "artist": r.artist,
+                "play_count": r.play_count
+            }
+            for r in most_played_result
+        ],
+        "highest_rated_reviews": [
+            {
+                "record_id": rv.record_id,
+                "album_name": rv.record.album_name if rv.record else "未知",
+                "user_name": rv.user_name,
+                "rating": rv.rating,
+                "content": rv.content
+            }
+            for rv in highest_rated
+        ]
     }
 
 
